@@ -1,0 +1,207 @@
+import argparse
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset, random_split
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------------- Dataset ---------------- #
+class INSDataset(Dataset):
+    def __init__(self, csv_files, seq_len=1):
+        data_list = []
+        for file in csv_files:
+            df = pd.read_csv(file)
+            data_list.append(df.values)
+        data = np.concatenate(data_list, axis=0)
+
+        X = data[:, :-15]   # 6 input features
+        y = data[:, -15:]   # 15 target features
+
+        self.seq_len = seq_len
+        self.samples_X, self.samples_y = [], []
+
+        # sliding window
+        for i in range(len(X) - seq_len + 1):
+            self.samples_X.append(X[i:i+seq_len])
+            self.samples_y.append(y[i+seq_len-1])  # predict last step
+
+        self.samples_X = torch.tensor(np.array(self.samples_X), dtype=torch.float32)
+        self.samples_y = torch.tensor(np.array(self.samples_y), dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.samples_X)
+
+    def __getitem__(self, idx):
+        return self.samples_X[idx], self.samples_y[idx]
+
+# ---------------- Models ---------------- #
+class MLP(nn.Module):
+    def __init__(self, input_size, output_size):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(input_size, 128),
+            nn.ReLU(),
+            nn.Linear(128, output_size)
+        )
+
+    def forward(self, x):
+        if x.dim() == 3:  # (batch, seq_len, features)
+            x = x[:, -1, :]  # take last timestep
+        return self.fc(x)
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])  # last timestep
+        return out
+
+class GRUModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
+        super().__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.gru(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+class RNNModel(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, num_layers=1):
+        super().__init__()
+        self.rnn = nn.RNN(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        out, _ = self.rnn(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+# ---------------- Training ---------------- #
+def train_model(model, train_loader, val_loader, epochs=10, device="cpu"):
+    model.to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    loss_fn = nn.MSELoss()
+
+    train_losses, val_losses = [], []
+
+    for epoch in range(epochs):
+        # Train
+        model.train()
+        total_train = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = loss_fn(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            total_train += loss.item()
+        avg_train = total_train / len(train_loader)
+
+        # Validate
+        model.eval()
+        total_val = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+                loss = loss_fn(outputs, y_batch)
+                total_val += loss.item()
+        avg_val = total_val / len(val_loader)
+
+        train_losses.append(avg_train)
+        val_losses.append(avg_val)
+        print(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train:.6f}, Val Loss: {avg_val:.6f}")
+
+    return train_losses, val_losses
+
+# ---------------- Testing ---------------- #
+def test_model(model, test_loader, device="cpu"):
+    model.to(device)
+    model.eval()
+    preds, truths = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            preds.append(outputs.cpu().numpy())
+            truths.append(y_batch.cpu().numpy())
+    return np.vstack(preds), np.vstack(truths)
+
+# ---------------- Plotting ---------------- #
+def plot_losses(train_losses, val_losses, model_name):
+    plt.figure(figsize=(6,4))
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_losses, label="Val Loss")
+    plt.title(f"Loss Curve - {model_name}")
+    plt.xlabel("Epoch")
+    plt.ylabel("MSE Loss")
+    plt.legend()
+    plt.show()
+
+def plot_test_results(y_true, y_pred, model_name, sample_size=14):
+    fig, axes = plt.subplots(5, 3, figsize=(15,12))  # 15 targets → 5x3 grid
+    axes = axes.flatten()
+    idx = np.arange(sample_size)
+
+    for i in range(15):
+        axes[i].plot(idx, y_true[:sample_size, i], label="True", marker="o")
+        axes[i].plot(idx, y_pred[:sample_size, i], label="Pred", marker="x")
+        axes[i].set_title(f"Target {i+1}")
+        axes[i].legend()
+
+    plt.suptitle(f"Test Results - {model_name}")
+    plt.tight_layout()
+    plt.show()
+
+# ---------------- Main ---------------- #
+def main(args):
+    dataset = INSDataset(args.csv, seq_len=args.seq_len)
+    input_size = dataset.samples_X.shape[2]
+    output_size = dataset.samples_y.shape[1]
+
+    # Split into train/val/test
+    train_size = int(0.7 * len(dataset))
+    val_size = int(0.15 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_dataset, val_dataset, test_dataset = random_split(dataset, [train_size, val_size, test_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=32)
+    test_loader = DataLoader(test_dataset, batch_size=32)
+
+    models = {
+        "mlp": MLP(input_size, output_size),
+        "lstm": LSTMModel(input_size, hidden_size=64, output_size=output_size),
+        "gru": GRUModel(input_size, hidden_size=64, output_size=output_size),
+        "rnn": RNNModel(input_size, hidden_size=64, output_size=output_size),
+    }
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    for model_name in args.models:
+        print(f"\nTraining model: {model_name}")
+        model = models[model_name]
+        train_losses, val_losses = train_model(model, train_loader, val_loader, epochs=args.epochs, device=device)
+        plot_losses(train_losses, val_losses, model_name)
+
+        y_pred, y_true = test_model(model, test_loader, device=device)
+        plot_test_results(y_true, y_pred, model_name)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv", nargs="+", required=True)
+    parser.add_argument("--models", nargs="+", default=["mlp"])
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--seq-len", type=int, default=1)
+    args = parser.parse_args()
+    main(args)
