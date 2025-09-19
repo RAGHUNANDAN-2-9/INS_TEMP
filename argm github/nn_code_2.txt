@@ -1,9 +1,9 @@
 # Simple PyTorch script for INS calibration
 # Load train and test CSVs, train a basic neural network with 2 hidden layers
 # Split train into train/validation, print train/val MSE losses, plot losses
-# Predict on test CSV, plot simple actual vs predicted line plots per target
+# Predict on test CSV, plot simple actual vs predicted line plots with custom labels
 # Added early stopping and OneCycleLR scheduler for small dataset convergence
-# Edit CSV paths and target indices at the top
+# Edit CSV paths, target indices, and target labels at the top
 
 import pandas as pd
 import numpy as np
@@ -24,10 +24,11 @@ plt.rcParams['font.size'] = 10
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {device}')
 
-# User inputs: Replace with your CSV paths
-TRAIN_CSV = r'C:\\THESIS_PINNS\\temp_storage\\train.csv'  # Train CSV (150 samples, 21 columns: 6 inputs, 15 targets)
-TEST_CSV = r'C:\\THESIS_PINNS\\temp_storage\\test.csv'    # Test CSV (14 samples, 21 columns)
+# User inputs: Replace with your CSV paths and customize labels
+TRAIN_CSV = r'C:\Users\raghu\Downloads\train.csv'  # Train CSV (150 samples, 21 columns: 6 inputs, 15 targets)
+TEST_CSV = r'C:\Users\raghu\Downloads\test.csv'    # Test CSV (14 samples, 21 columns)
 TARGET_INDICES = [0, 1, 2]  # First 3 targets; set to None for all 15 or e.g., [0,1,2,3,4,5] for 6
+TARGET_LABELS = ['Bias X', 'Bias Y', 'Bias Z']  # Custom labels for selected targets; match TARGET_INDICES or set None for default
 STANDARDIZE = False  # Set True to try standardization (inputs: accel/temp XYZ; targets: bias/sf/misalignment)
 EPOCHS = 100
 BATCH_SIZE = 32
@@ -52,8 +53,12 @@ print(f"Loaded {len(test_df)} test samples.")
 input_cols = train_df.columns[:6]
 if TARGET_INDICES is None:
     target_cols = train_df.columns[6:]
+    if TARGET_LABELS is None:
+        TARGET_LABELS = [f'Target {i+1}' for i in range(len(target_cols))]
 else:
     target_cols = [train_df.columns[6 + idx] for idx in TARGET_INDICES]
+    if TARGET_LABELS is None or len(TARGET_LABELS) != len(TARGET_INDICES):
+        TARGET_LABELS = [f'Target {i+1}' for i in range(len(TARGET_INDICES))]
 num_targets = len(target_cols)  # Number of targets (e.g., 3, 6, or 15)
 
 # Prepare data
@@ -193,19 +198,19 @@ if STANDARDIZE and scaler_y is not None:
 test_mse = mean_squared_error(y_true, y_pred, multioutput='raw_values')
 print("Test MSE per target:")
 for i, m in enumerate(test_mse):
-    print(f"Target {i+1}: {m:.6f}")
+    print(f"{TARGET_LABELS[i]}: {m:.6f}")
 
-# Simple actual vs predicted line plots (one per target)
+# Simple actual vs predicted line plots with custom labels
 for i in range(num_targets):
     plt.figure(figsize=(6, 4))
     plt.plot(y_true[:, i], label='Actual', marker='o')
     plt.plot(y_pred[:, i], label='Predicted', marker='x')
     plt.xlabel('Sample Index')
     plt.ylabel('Value')
-    plt.title(f'Target {i+1} Actual vs Predicted')
+    plt.title(f'{TARGET_LABELS[i]} Actual vs Predicted')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f'target_{i+1}_plot.png')
+    plt.savefig(f'{TARGET_LABELS[i].replace(" ", "_")}_plot.png')
     plt.show()
 
 # Save model
