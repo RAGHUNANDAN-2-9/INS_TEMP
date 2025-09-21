@@ -1,0 +1,224 @@
+# Simple PyTorch script for INS calibration
+# Load train and test CSVs, train a neural network with 2 hidden layers
+# Split train into train/validation, print train/val MSE losses, plot losses
+# Predict on test CSV, plot actual vs predicted line plots with custom labels
+# Save test predictions as predictions.csv
+# Added early stopping and OneCycleLR scheduler for small dataset convergence
+# Edit CSV paths, target indices, and target labels at the top
+
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+
+# Set basic plot style
+plt.rcParams['figure.dpi'] = 300
+plt.rcParams['font.size'] = 10
+
+# Use GPU if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f'Using device: {device}')
+
+# User inputs: Replace with your CSV paths and customize labels
+TRAIN_CSV = r'C:\\THESIS_PINNS\\temp_storage\\nn_code_stuff\\train.csv'  # Train CSV (150 samples, 21 columns: 6 inputs, 15 targets)
+TEST_CSV = r'C:\\THESIS_PINNS\\temp_storage\\nn_code_stuff\\test.csv'   # Test CSV (14 samples, 21 columns)
+TARGET_INDICES = [0, 1, 2]  # First 3 targets; set to None for all 15 or e.g., [0,1,2,3,4,5] for 6
+TARGET_LABELS = ['Bias X', 'Bias Y', 'Bias Z']  # Custom labels for selected targets; match TARGET_INDICES or set None for default
+STANDARDIZE = False  # Set True to try standardization (inputs: accel/temp XYZ; targets: bias/sf/misalignment)
+EPOCHS = 100
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+PATIENCE = 10  # Early stopping patience
+
+# Load train CSV
+train_df = pd.read_csv(TRAIN_CSV)
+if train_df.shape[1] != 21:
+    print("Error: Train CSV must have 21 columns (6 inputs + 15 targets).")
+    exit()
+print(f"Loaded {len(train_df)} training samples.")
+
+# Load test CSV
+test_df = pd.read_csv(TEST_CSV)
+if test_df.shape[1] != 21:
+    print("Error: Test CSV must have 21 columns.")
+    exit()
+print(f"Loaded {len(test_df)} test samples.")
+
+# Select inputs (first 6 columns) and targets
+input_cols = train_df.columns[:6]
+if TARGET_INDICES is None:
+    target_cols = train_df.columns[6:]
+    if TARGET_LABELS is None:
+        TARGET_LABELS = [f'Target {i+1}' for i in range(len(target_cols))]
+else:
+    target_cols = [train_df.columns[6 + idx] for idx in TARGET_INDICES]
+    if TARGET_LABELS is None or len(TARGET_LABELS) != len(TARGET_INDICES):
+        TARGET_LABELS = [f'Target {i+1}' for i in range(len(TARGET_INDICES))]
+num_targets = len(target_cols)  # Number of targets (e.g., 3, 6, or 15)
+
+# Prepare data
+X_train_full = train_df[input_cols].values.astype(np.float32)
+y_train_full = train_df[target_cols].values.astype(np.float32)
+X_test = test_df[input_cols].values.astype(np.float32)
+y_test = test_df[target_cols].values.astype(np.float32)
+
+# Standardize if enabled
+if STANDARDIZE:
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    X_train_full = scaler_X.fit_transform(X_train_full)
+    y_train_full = scaler_y.fit_transform(y_train_full)
+    X_test = scaler_X.transform(X_test)
+    y_test = scaler_y.transform(y_test)
+    print("Applied standardization.")
+else:
+    scaler_y = None
+    print("Skipped standardization.")
+
+# Split train into train and validation (80-20)
+X_train, X_val, y_train, y_val = train_test_split(X_train_full, y_train_full, test_size=0.2, random_state=42)
+
+# Convert to tensors
+train_dataset = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
+val_dataset = TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val))
+test_dataset = TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test))
+
+# Data loaders
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+test_loader = DataLoader(test_dataset, batch_size=len(test_dataset), shuffle=False)
+
+# Simple neural network with 2 hidden layers
+model = nn.Sequential(
+    nn.Linear(6, 64),  # Input: 6 features
+    nn.ReLU(),
+    nn.Linear(64, 32), # Hidden layer 1
+    nn.ReLU(),
+    nn.Linear(32, num_targets)  # Hidden layer 2 to output (e.g., 3, 6, or 15 targets)
+).to(device)
+
+# Loss and optimizer
+criterion = nn.MSELoss()
+optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+# OneCycleLR scheduler for small dataset
+steps_per_epoch = len(train_loader)
+scheduler = optim.lr_scheduler.OneCycleLR(
+    optimizer,
+    max_lr=LEARNING_RATE,
+    total_steps=EPOCHS * steps_per_epoch,
+    pct_start=0.3  # 30% of epochs for ramp-up, good for small datasets
+)
+
+# Train loop with early stopping
+train_losses = []
+val_losses = []
+best_val_loss = float('inf')
+epochs_no_improve = 0
+
+for epoch in range(EPOCHS):
+    model.train()
+    train_loss = 0.0
+    for X_batch, y_batch in train_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        optimizer.zero_grad()
+        outputs = model(X_batch)
+        loss = criterion(outputs, y_batch)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()  # Update LR per batch
+        train_loss += loss.item() * X_batch.size(0)
+    train_loss /= len(train_loader.dataset)
+    train_losses.append(train_loss)
+    
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            val_loss += loss.item() * X_batch.size(0)
+    val_loss /= len(val_loader.dataset)
+    val_losses.append(val_loss)
+    
+    print(f'Epoch [{epoch+1}/{EPOCHS}], Train MSE Loss: {train_loss:.6f}, Val MSE Loss: {val_loss:.6f}')
+    
+    # Early stopping
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), 'best_model.pth')
+    else:
+        epochs_no_improve += 1
+        if epochs_no_improve >= PATIENCE:
+            print(f'Early stopping at epoch {epoch+1}')
+            break
+
+# Load best model
+model.load_state_dict(torch.load('best_model.pth'))
+
+# Plot train/val losses
+plt.figure(figsize=(6, 4))
+plt.plot(train_losses, label='Train Loss')
+plt.plot(val_losses, label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('MSE Loss')
+plt.title('Train and Val MSE Losses')
+plt.legend()
+plt.grid(True)
+plt.savefig('losses.png')
+plt.show()
+
+# Predict on test
+model.eval()
+predictions = []
+actuals = []
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        X_batch = X_batch.to(device)
+        outputs = model(X_batch)
+        predictions.append(outputs.cpu().numpy())
+        actuals.append(y_batch.numpy())
+
+y_pred = np.vstack(predictions)
+y_true = np.vstack(actuals)
+
+if STANDARDIZE and scaler_y is not None:
+    y_pred = scaler_y.inverse_transform(y_pred)
+    y_true = scaler_y.inverse_transform(y_true)
+    print("Inverse transformed predictions.")
+
+# Save test predictions as CSV
+pred_df = pd.DataFrame(y_pred, columns=TARGET_LABELS)
+pred_df.to_csv('predictions.csv', index=False)
+print("Saved test predictions to predictions.csv")
+
+# Print test MSE
+test_mse = mean_squared_error(y_true, y_pred, multioutput='raw_values')
+print("Test MSE per target:")
+for i, m in enumerate(test_mse):
+    print(f"{TARGET_LABELS[i]}: {m:.6f}")
+
+# Simple actual vs predicted line plots with custom labels
+for i in range(num_targets):
+    plt.figure(figsize=(6, 4))
+    plt.plot(y_true[:, i], label='Actual', marker='o')
+    plt.plot(y_pred[:, i], label='Predicted', marker='x')
+    plt.xlabel('Sample Index')
+    plt.ylabel('Value')
+    plt.title(f'{TARGET_LABELS[i]} Actual vs Predicted')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f'{TARGET_LABELS[i].replace(" ", "_")}_plot.png')
+    plt.show()
+
+# Save model
+torch.save(model.state_dict(), 'ins_model.pth')
+print("Model saved as 'ins_model.pth'.")
